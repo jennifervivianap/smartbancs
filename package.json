@@ -1,0 +1,6 @@
+{
+  "name": "smartbancs-mvp",
+  "private": true,
+  "scripts": {"etl": "tsx scripts/etl.ts"},
+  "devDependencies": {"tsx": "^4.19.2", "typescript": "^5.7.2"}
+}
