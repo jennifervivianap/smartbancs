@@ -1,0 +1,7 @@
+{
+  "name": "smartbancs-ai-mock",
+  "private": true,
+  "scripts": {"build": "tsc", "start": "node dist/server.js"},
+  "dependencies": {"express": "^4.21.2"},
+  "devDependencies": {"@types/express": "^5.0.0", "@types/node": "^22.10.5", "typescript": "^5.7.2"}
+}
