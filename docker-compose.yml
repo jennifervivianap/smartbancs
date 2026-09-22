@@ -23,6 +23,8 @@ services:
     container_name: smartbancs-ai-mock
     environment:
       PORT: 4001
+      AI_MOCK_DELAY_MS: ${AI_MOCK_DELAY_MS:-75}
+      AI_MOCK_FAIL: ${AI_MOCK_FAIL:-false}
     ports:
       - "4001:4001"
 

@@ -64,11 +64,17 @@ app.post('/transactions', async (req, res) => {
   try {
     await client.query('BEGIN');
     if (idempotencyKey) {
-      const existing = await client.query('SELECT id, trace_id, status FROM transactions WHERE source_account_id = $1 AND idempotency_key = $2', [sourceAccountId, idempotencyKey]);
+      const existing = await client.query('SELECT id, trace_id, status, target_account_id, amount_cents, currency FROM transactions WHERE source_account_id = $1 AND idempotency_key = $2', [sourceAccountId, idempotencyKey]);
       if (existing.rowCount) {
+        const previous = existing.rows[0];
+        if (previous.target_account_id !== targetAccountId || Number(previous.amount_cents) !== amountCents || previous.currency.trim() !== currency) {
+          await rollback(client);
+          client.release();
+          return res.status(409).json({ error: 'Idempotency key already used with different transaction data', traceId });
+        }
         await client.query('COMMIT');
         client.release();
-        return res.status(200).json({ transactionId: existing.rows[0].id, traceId: existing.rows[0].trace_id, status: existing.rows[0].status, idempotent: true });
+        return res.status(200).json({ transactionId: previous.id, traceId: previous.trace_id, status: previous.status, idempotent: true });
       }
     }
     const ids = [sourceAccountId, targetAccountId].sort();
