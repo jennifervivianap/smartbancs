@@ -5,7 +5,7 @@ const port = Number(process.env.PORT ?? 4001);
 app.use(express.json());
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'ai-mock' }));
-app.post('/recommendations', async (req, res) => {
+app.post('/ ', async (req, res) => {
   await new Promise((resolve) => setTimeout(resolve, 75));
   const amountCents = Number(req.body.amountCents ?? 0);
   const recommendation = amountCents >= 100000
