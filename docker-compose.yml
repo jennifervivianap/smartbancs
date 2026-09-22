@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: smartbancs-db
+    environment:
+      POSTGRES_USER: smartbancs
+      POSTGRES_PASSWORD: smartbancs
+      POSTGRES_DB: smartbancs
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartbancs -d smartbancs"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ai-mock:
+    build:
+      context: ./services/ai-mock
+    container_name: smartbancs-ai-mock
+    environment:
+      PORT: 4001
+    ports:
+      - "4001:4001"
+
+  api:
+    build:
+      context: ./services/api
+    container_name: smartbancs-api
+    environment:
+      PORT: 4000
+      DATABASE_URL: postgres://smartbancs:smartbancs@postgres:5432/smartbancs
+      AI_SERVICE_URL: http://ai-mock:4001/recommendations
+      LOG_LEVEL: info
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-mock:
+        condition: service_started
+
+volumes:
+  pgdata:
