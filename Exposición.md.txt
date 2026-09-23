@@ -1,0 +1,563 @@
+# Guia de exposicion de SmartBancs
+
+## Objetivo de esta guia
+
+Esta guia sirve para presentar el proyecto SmartBancs, explicar sus decisiones tecnicas y demostrar su funcionamiento en vivo. El orden recomendado es:
+
+1. Presentar el problema y el objetivo.
+2. Mostrar la arquitectura y los componentes.
+3. Levantar el entorno.
+4. Ejecutar una transferencia exitosa.
+5. Demostrar consistencia, idempotencia y errores.
+6. Mostrar la separacion entre la transferencia y la recomendacion de IA.
+7. Ejecutar el ETL.
+8. Ejecutar el smoke test y cerrar con limites y evolucion a produccion.
+
+La idea central de la exposicion es demostrar que el movimiento de dinero es atomico y consistente, mientras que la recomendacion de IA es un proceso posterior y no puede deshacer una transferencia confirmada.
+
+## Antes de la exposicion
+
+### Requisitos
+
+Verifica que esten disponibles:
+
+- Docker Desktop ejecutandose.
+- Docker Compose.
+- Node.js y npm.
+- El repositorio en la rama que contiene la entrega.
+- Puertos libres `4000`, `4001` y `5432`.
+
+### Preparacion recomendada
+
+Desde la raiz del proyecto ejecuta:
+
+```bash
+docker compose up --build -d
+```
+
+Espera a que PostgreSQL este saludable y comprueba los servicios:
+
+```bash
+curl http://localhost:4000/health
+curl http://localhost:4001/health
+```
+
+Respuestas esperadas:
+
+```json
+{"status":"ok","service":"api"}
+```
+
+```json
+{"status":"ok","service":"ai-mock"}
+```
+
+Instala las dependencias del proyecto raiz si vas a ejecutar el ETL o el smoke test:
+
+```bash
+npm install
+```
+
+No ejecutes `docker compose down` antes de terminar la demostracion. Ese comando detiene los servicios.
+
+## 1. Introduccion del proyecto
+
+### Que decir
+
+> SmartBancs es un MVP de transferencias entre cuentas. El sistema recibe una solicitud REST, valida los datos, actualiza de forma atomica las cuentas en PostgreSQL y registra la transferencia. Despues del commit solicita una recomendacion a un servicio de IA independiente. La recomendacion no bloquea ni revierte la operacion financiera.
+
+> El proyecto tambien contiene un ETL para limpiar transacciones historicas y un smoke test que comprueba los escenarios principales de la API.
+
+### Que mostrar
+
+Muestra brevemente la estructura del repositorio:
+
+```text
+services/api/src/server.ts       API de transferencias
+services/ai-mock/src/server.ts   Servicio de recomendaciones
+scripts/etl.ts                   Limpieza de datos
+scripts/smoke-test.ts            Prueba de integracion
+ db/init.sql                     Tablas, indices y datos iniciales
+ docker-compose.yml              Entorno reproducible
+ data/                            Datos raw y limpios
+ DOCUMENTO_TECNICO.md            Arquitectura y decisiones tecnicas
+```
+
+Aclara que `scripts/smoke-test.ts` es una prueba de humo o integracion contra la API, no una prueba unitaria del ETL.
+
+## 2. Explicacion de la arquitectura
+
+### Que decir
+
+> La arquitectura actual esta compuesta por tres contenedores gestionados por Docker Compose: la API, PostgreSQL y el AI Mock. El cliente se comunica con la API en el puerto 4000. La API utiliza PostgreSQL en el puerto 5432 como fuente de verdad para las cuentas, saldos y transferencias. El AI Mock escucha en el puerto 4001 y simula una recomendacion de inteligencia artificial.
+
+> El ETL se ejecuta como un proceso independiente desde Node.js. No participa en el camino critico de una transferencia en tiempo real.
+
+> La observabilidad esta integrada en la API mediante logs JSON, metricas Prometheus y un traceId. Esto permite seguir una operacion y diagnosticar errores.
+
+### Puntos importantes al presentar el diagrama
+
+Senala el recorrido con el cursor:
+
+1. Cliente HTTP.
+2. API REST SmartBancs.
+3. PostgreSQL como fuente de verdad.
+4. AI Mock despues del commit.
+5. Logs y metricas.
+6. ETL fuera del flujo transaccional.
+
+Di esta aclaracion para evitar confusiones:
+
+> El balanceador, las replicas de API, el broker durable, los workers y el adaptador real hacia Bancs aparecen como evolucion productiva. No forman parte del MVP ejecutable actual.
+
+### Tabla de componentes
+
+Explicala con este texto:
+
+> La tabla relaciona cada componente con su responsabilidad y con la implementacion concreta del repositorio. La columna de implementacion actual es importante porque separa lo que existe y se puede ejecutar de lo que se propone para una instalacion productiva.
+
+| Componente | Que debes explicar |
+|---|---|
+| Cliente | Envia solicitudes HTTP a `POST /transactions`; puede representarse con curl o con el smoke test. |
+| API | Valida datos, controla idempotencia, bloquea cuentas y ejecuta la transferencia atomica. |
+| PostgreSQL | Guarda cuentas, saldos, transferencias y recomendaciones; aplica claves, indices y restricciones. |
+| AI Mock | Simula latencia, recomendaciones y fallos sin depender de un modelo real. |
+| ETL | Limpia datos raw, transforma montos a centavos y normaliza moneda y fecha. |
+| Observabilidad | Expone logs, metricas y traceId para diagnostico y auditoria. |
+| Broker y adaptador Bancs | Son una evolucion futura para sincronizar con un core legado sin bloquear la API. |
+
+## 3. Explicacion del flujo de transferencia
+
+### Que decir antes de ejecutar
+
+> Voy a demostrar primero una transferencia exitosa. La solicitud contiene una cuenta origen, una cuenta destino, un importe en centavos, la moneda y una clave de idempotencia.
+
+> La API no utiliza numeros decimales para el dinero. Recibe `amountCents`, por ejemplo `1000` representa `10.00 USD`. Esto evita errores de precision de punto flotante.
+
+### Ejecutar una transferencia exitosa
+
+Usa una clave nueva en cada demostracion:
+
+```bash
+curl -i -X POST http://localhost:4000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"sourceAccountId":"11111111-1111-1111-1111-111111111111","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":1000,"currency":"USD","idempotencyKey":"demo-001"}'
+```
+
+En PowerShell puedes usar una sola linea:
+
+```powershell
+curl.exe -i -X POST http://localhost:4000/transactions -H "Content-Type: application/json" -d '{"sourceAccountId":"11111111-1111-1111-1111-111111111111","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":1000,"currency":"USD","idempotencyKey":"demo-001"}'
+```
+
+Respuesta esperada:
+
+```json
+{
+  "transactionId": "uuid",
+  "traceId": "uuid",
+  "status": "COMPLETED"
+}
+```
+
+### Explicar el flujo paso a paso
+
+Mientras muestras el diagrama de secuencia, explica:
+
+1. La API recibe `POST /transactions`.
+2. Valida que las cuentas sean diferentes y que el importe sea un entero positivo.
+3. Inicia `BEGIN` en PostgreSQL.
+4. Comprueba la `idempotencyKey` para evitar duplicar un reintento.
+5. Bloquea las cuentas con `SELECT ... FOR UPDATE`.
+6. Bloquea las cuentas en orden determinista para reducir deadlocks.
+7. Comprueba la moneda y el saldo disponible.
+8. Descuenta el importe de la cuenta origen.
+9. Acredita el mismo importe en la cuenta destino.
+10. Inserta el registro en `transactions`.
+11. Ejecuta `COMMIT`.
+12. Responde `201` con `COMPLETED`.
+13. Solicita la recomendacion al AI Mock despues del commit.
+
+Frase recomendada:
+
+> La garantia importante es que el descuento, la acreditacion y el registro historico ocurren dentro de la misma transaccion de base de datos. Si algo falla antes del commit, se ejecuta rollback y no queda una transferencia parcial.
+
+## 4. Mostrar la persistencia en PostgreSQL
+
+Despues de ejecutar la transferencia, muestra los registros:
+
+```bash
+docker compose exec postgres psql -U smartbancs -d smartbancs -c "SELECT id, source_account_id, target_account_id, amount_cents, currency, status, idempotency_key FROM transactions ORDER BY created_at DESC LIMIT 5;"
+```
+
+Muestra los saldos:
+
+```bash
+docker compose exec postgres psql -U smartbancs -d smartbancs -c "SELECT id, owner_name, balance_cents, currency FROM accounts ORDER BY id;"
+```
+
+Que decir:
+
+> Aqui se observa que la transferencia no solo genero una respuesta HTTP: tambien modifico los saldos y creo un registro persistente en PostgreSQL.
+
+Para consultar la recomendacion guardada:
+
+```bash
+docker compose exec postgres psql -U smartbancs -d smartbancs -c "SELECT transaction_id, trace_id, recommendation, latency_ms FROM ai_recommendations ORDER BY created_at DESC LIMIT 5;"
+```
+
+## 5. Demostrar idempotencia
+
+### Objetivo
+
+Demostrar que repetir exactamente la misma solicitud no mueve el dinero dos veces.
+
+### Ejecutar
+
+Repite el mismo comando con la misma clave:
+
+```bash
+curl -i -X POST http://localhost:4000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"sourceAccountId":"11111111-1111-1111-1111-111111111111","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":1000,"currency":"USD","idempotencyKey":"demo-001"}'
+```
+
+Respuesta esperada:
+
+```json
+{
+  "transactionId": "mismo-id-de-la-primera-solicitud",
+  "traceId": "...",
+  "status": "COMPLETED",
+  "idempotent": true
+}
+```
+
+### Que decir
+
+> La segunda solicitud recibe el mismo resultado logico, pero no vuelve a descontar el saldo. La clave de idempotencia protege contra reintentos producidos por timeouts o problemas de red.
+
+### Demostrar conflicto de idempotencia
+
+Usa la misma clave, pero cambia el importe:
+
+```bash
+curl -i -X POST http://localhost:4000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"sourceAccountId":"11111111-1111-1111-1111-111111111111","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":2000,"currency":"USD","idempotencyKey":"demo-001"}'
+```
+
+Respuesta esperada: HTTP `409`.
+
+> La misma clave no puede reutilizarse con datos diferentes. Esto evita que un cliente use accidentalmente una clave anterior para ejecutar otra transferencia.
+
+## 6. Demostrar errores de validacion y negocio
+
+### Importe invalido
+
+```bash
+curl -i -X POST http://localhost:4000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"sourceAccountId":"11111111-1111-1111-1111-111111111111","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":0,"currency":"USD","idempotencyKey":"error-invalid-001"}'
+```
+
+Esperar HTTP `400`.
+
+> La API rechaza importes cero, negativos o que no sean enteros seguros antes de abrir una transaccion financiera.
+
+### Fondos insuficientes
+
+```bash
+curl -i -X POST http://localhost:4000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"sourceAccountId":"11111111-1111-1111-1111-111111111111","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":999999999,"currency":"USD","idempotencyKey":"error-funds-001"}'
+```
+
+Esperar HTTP `409`.
+
+> La operacion se rechaza porque el saldo de la cuenta origen es menor que el importe solicitado. Como ocurre antes del commit, no se modifica ningun saldo.
+
+### Cuenta inexistente
+
+```bash
+curl -i -X POST http://localhost:4000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"sourceAccountId":"99999999-9999-9999-9999-999999999999","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":100,"currency":"USD","idempotencyKey":"error-account-001"}'
+```
+
+Esperar HTTP `404`.
+
+> La API consulta las cuentas dentro de la transaccion y rechaza la solicitud si no encuentra las dos cuentas necesarias.
+
+### Moneda incompatible
+
+```bash
+curl -i -X POST http://localhost:4000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"sourceAccountId":"11111111-1111-1111-1111-111111111111","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":100,"currency":"EUR","idempotencyKey":"error-currency-001"}'
+```
+
+Esperar HTTP `400`.
+
+> La moneda de la transferencia debe coincidir con la moneda de las dos cuentas. El sistema no realiza conversiones implicitas.
+
+## 7. Demostrar concurrencia
+
+### Opcion recomendada: smoke test
+
+Ejecuta:
+
+```bash
+npm run test:smoke
+```
+
+El resultado esperado es parecido a:
+
+```json
+{
+  "passed": true,
+  "checks": [
+    "health",
+    "transfer",
+    "idempotency",
+    "idempotency-conflict",
+    "validation",
+    "insufficient-funds",
+    "concurrency"
+  ]
+}
+```
+
+### Que decir
+
+> El smoke test no es una prueba unitaria. Es una prueba de integracion que hace solicitudes HTTP reales contra la API levantada y comprueba el comportamiento completo de los componentes.
+
+> La parte de concurrencia lanza cinco transferencias en paralelo. La API usa transacciones, locks de fila y un orden estable de cuentas para proteger los saldos y reducir deadlocks.
+
+Aclara el limite:
+
+> Este test demuestra correccion basica bajo concurrencia, no demuestra 10.000 TPS. Para ese objetivo se necesita una prueba de carga dedicada y un entorno dimensionado para produccion.
+
+## 8. Demostrar la separacion de la IA
+
+### Preparar un caso exitoso
+
+Despues de ejecutar una transferencia, consulta los logs:
+
+```bash
+docker compose logs --tail=80 api ai-mock
+```
+
+Busca esta secuencia conceptual:
+
+```text
+transaction_received
+transaction_completed
+ai_call_started
+ai_call_succeeded
+```
+
+Consulta la tabla:
+
+```bash
+docker compose exec postgres psql -U smartbancs -d smartbancs -c "SELECT transaction_id, recommendation, latency_ms FROM ai_recommendations ORDER BY created_at DESC LIMIT 5;"
+```
+
+### Que decir
+
+> La transferencia se confirma primero. Solo despues la API llama al servicio de IA y guarda la recomendacion. Por eso la IA esta separada del camino critico financiero.
+
+> El AI Mock simula dos tipos de recomendacion: `saving_tip` para importes menores a 100000 centavos y `budget_alert` para importes iguales o superiores a 100000 centavos.
+
+### Demostrar que un fallo de IA no revierte la transferencia
+
+Deten el contenedor de IA:
+
+```bash
+docker compose stop ai-mock
+```
+
+Ejecuta una transferencia con una clave nueva:
+
+```bash
+curl -i -X POST http://localhost:4000/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"sourceAccountId":"11111111-1111-1111-1111-111111111111","targetAccountId":"22222222-2222-2222-2222-222222222222","amountCents":100,"currency":"USD","idempotencyKey":"ai-failure-001"}'
+```
+
+La API debe responder `201` y `COMPLETED`, aunque el log de IA registre un error.
+
+Comprueba que la transferencia existe:
+
+```bash
+docker compose exec postgres psql -U smartbancs -d smartbancs -c "SELECT id, status, amount_cents, idempotency_key FROM transactions WHERE idempotency_key = 'ai-failure-001';"
+```
+
+Que decir:
+
+> La falla de IA no afecta el commit financiero. La transferencia ya estaba confirmada en PostgreSQL, por lo que el sistema conserva el movimiento y registra el fallo secundario en logs y metricas.
+
+Vuelve a levantar el servicio:
+
+```bash
+docker compose start ai-mock
+```
+
+## 9. Mostrar observabilidad
+
+Consulta las metricas:
+
+```bash
+curl http://localhost:4000/metrics
+```
+
+Menciona estas metricas:
+
+- `smartbancs_transactions_total`: transacciones por estado.
+- `smartbancs_transaction_duration_ms`: duracion de las transacciones.
+- `smartbancs_ai_calls_total`: llamadas a IA por resultado.
+- Metricas por defecto de Node.js.
+
+Consulta los logs:
+
+```bash
+docker compose logs --tail=100 api ai-mock
+```
+
+### Que decir
+
+> Cada operacion tiene un `traceId`. Este identificador permite relacionar la solicitud, la transferencia confirmada y la llamada a IA. En produccion se podria propagar tambien hacia Bancs, un broker y herramientas como OpenTelemetry.
+
+## 10. Ejecutar y explicar el ETL
+
+Muestra primero los datos de entrada:
+
+```bash
+npm run etl
+```
+
+El resultado esperado tiene esta forma:
+
+```json
+{"inputRows":9,"outputRows":6,"rejectedRows":3}
+```
+
+Consulta la salida:
+
+```bash
+Get-Content data/clean-transactions.json
+```
+
+En Git Bash o Linux:
+
+```bash
+cat data/clean-transactions.json
+```
+
+### Que decir
+
+> El ETL es un proceso separado de las transferencias en tiempo real. Lee `data/raw-transactions.json`, rechaza importes nulos, invalidos o no positivos, convierte los importes a centavos, normaliza la moneda a mayusculas y convierte las fechas a ISO. El resultado se guarda en `data/clean-transactions.json`.
+
+> Esto prepara datos historicos para analisis o entrenamiento, pero no modifica directamente los saldos de la API.
+
+## 11. Explicar la base de datos
+
+Abre `db/init.sql` y senala:
+
+- `accounts`: cuentas y saldos.
+- `transactions`: historial de transferencias.
+- `ai_recommendations`: recomendaciones asociadas a transferencias.
+- Claves foraneas entre cuentas y transacciones.
+- `BIGINT` para importes en centavos.
+- Indice unico parcial de idempotencia.
+- Restriccion de saldo no negativo.
+
+### Que decir
+
+> PostgreSQL es la fuente de verdad financiera. La API no considera terminada una transferencia solo porque envio una respuesta HTTP; primero debe confirmar el commit de la base de datos.
+
+## 12. Arquitectura productiva y limites del MVP
+
+### Que decir
+
+> El MVP usa una instancia de API y una base de datos local para demostrar el flujo y la consistencia. Para produccion, la API podria escalar horizontalmente con varias instancias detras de un balanceador, porque los datos importantes se encuentran en PostgreSQL y no en la memoria de una instancia.
+
+> Para soportar picos de hasta 10.000 TPS tambien se necesitarian un pool de conexiones controlado, PgBouncer, PostgreSQL dimensionado, broker durable, workers para IA, backpressure, rate limiting, autoscaling y pruebas de carga. El MVP demuestra el patron de consistencia, pero no pretende demostrar 10.000 TPS en un equipo local.
+
+Aclara que no debes afirmar que esas capacidades ya estan implementadas.
+
+## 13. Incidente simulado y respuesta
+
+Si te preguntan como responderias ante latencia alta o deadlocks, explica:
+
+1. Confirmaria el alcance con `/health`, `/metrics`, errores y p95/p99.
+2. Agruparia logs por `traceId` y razon del rechazo.
+3. Revisaria conexiones, `pg_stat_activity`, `pg_locks`, CPU, memoria y disco.
+4. Identificaria si existe una cuenta muy utilizada o un `hot row`.
+5. Aislaria IA y otros consumidores no criticos.
+6. Activaria backpressure y reduciria reintentos agresivos.
+7. Mantendria idempotencia para que los reintentos no dupliquen transferencias.
+8. Haría un post mortem con causa raiz, impacto y acciones preventivas.
+
+## 14. Orden recomendado para una demostracion de 10 minutos
+
+### Minuto 0-1: objetivo
+
+Explica el problema, la transferencia atomica y la recomendacion posterior.
+
+### Minuto 1-3: arquitectura
+
+Muestra el diagrama, Docker Compose y la tabla de componentes.
+
+### Minuto 3-5: transferencia exitosa
+
+Ejecuta `curl`, muestra el `201`, consulta la base y ensena el registro creado.
+
+### Minuto 5-6: idempotencia
+
+Repite la solicitud, muestra `idempotent: true` y cambia el importe para provocar `409`.
+
+### Minuto 6-7: errores
+
+Muestra importe invalido `400` y fondos insuficientes `409`.
+
+### Minuto 7-8: IA
+
+Muestra logs y la tabla `ai_recommendations`; detiene el AI Mock y demuestra que una transferencia nueva sigue en `COMPLETED`.
+
+### Minuto 8-9: ETL y smoke test
+
+Ejecuta `npm run etl` y `npm run test:smoke`.
+
+### Minuto 9-10: cierre
+
+Explica observabilidad, limites del MVP, escalado horizontal y evolucion productiva.
+
+## 15. Cierre sugerido
+
+> SmartBancs prioriza la consistencia del dinero: valida la solicitud, controla los reintentos con idempotencia, bloquea las cuentas, actualiza ambos saldos y registra la transferencia dentro de una transaccion atomica de PostgreSQL. La recomendacion de IA se ejecuta despues del commit y esta aislada del resultado financiero. El ETL tambien esta separado y prepara datos historicos. El MVP demuestra estos patrones y documenta como evolucionar hacia alta disponibilidad, integracion con Bancs y mayor capacidad en produccion.
+
+## 16. Comandos de cierre
+
+Cuando termines la demostracion:
+
+```bash
+docker compose logs --tail=50 api ai-mock
+docker compose ps
+docker compose down
+```
+
+No borres el volumen si quieres conservar la base local para otra demostracion. Si necesitas reiniciar completamente los datos de demostracion, usa el procedimiento de limpieza definido por tu entorno y confirma antes de eliminar `pgdata`.
+
+## Mensajes clave para recordar
+
+- PostgreSQL es la fuente de verdad.
+- `BEGIN`, `COMMIT` y `ROLLBACK` protegen la atomicidad.
+- `SELECT ... FOR UPDATE` protege los saldos concurrentes.
+- El orden determinista de locks reduce deadlocks.
+- `idempotencyKey` evita duplicar reintentos.
+- La IA se ejecuta despues del commit.
+- Un fallo de IA no revierte una transferencia confirmada.
+- El ETL no participa en transferencias en tiempo real.
+- El smoke test es una prueba de integracion, no un test unitario.
+- El MVP no demuestra 10.000 TPS; documenta el camino para escalar.

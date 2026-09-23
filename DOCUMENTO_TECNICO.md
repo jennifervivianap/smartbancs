@@ -195,9 +195,52 @@ Los logs JSON registran eventos de recepcion, rechazo, confirmacion, errores y l
 
 `/metrics` expone volumen de transacciones por estado, duracion de transacciones, llamadas a IA por resultado y metricas por defecto de Node.js. El `traceId` se acepta desde `x-trace-id` si tiene formato UUID o se genera automaticamente.
 
+### Diseno de observabilidad
+
+La observabilidad se organiza en tres senales complementarias:
+
+| Senal | Datos registrados | Utilidad operativa |
+|---|---|---|
+| Logs | `event`, `traceId`, `transactionId`, estado, motivo, error y duracion | Reconstruir una transferencia concreta y distinguir validacion, fondos insuficientes, conflicto de idempotencia o fallo interno. |
+| Metricas | Conteo por estado, duracion de transacciones, llamadas a IA y metricas de Node.js | Detectar aumento de errores, degradacion de latencia, saturacion del proceso y diferencia entre volumen recibido y completado. |
+| Trazabilidad | `traceId` en API, transaccion y llamada a IA | Seguir una operacion entre los componentes y correlacionar la respuesta HTTP con sus logs y recomendaciones. |
+
+La informacion debe ser estructurada y no debe incluir contrasenas, tokens ni datos sensibles innecesarios. En produccion, los logs se centralizarian y las metricas se visualizarian en un dashboard con alertas. El MVP expone las señales mediante logs de Docker y el endpoint `/metrics`.
+
 ### Indicadores operativos
 
-Para diagnosticar degradacion se deben observar throughput, p95/p99, tasa de errores, timeouts, conexiones activas y esperando, locks, deadlocks, CPU, memoria, disco, WAL y profundidad de colas. En produccion se recomienda OpenTelemetry para propagar el trace entre API, base de datos, IA y Bancs.
+Para diagnosticar degradacion se deben observar:
+
+- Throughput de solicitudes y transacciones completadas, rechazadas y fallidas.
+- Latencia media y percentiles p95/p99 del endpoint `/transactions`.
+- Tasa de respuestas `4xx`, `5xx`, timeouts y errores de conexión a PostgreSQL.
+- Estado del pool: conexiones activas, disponibles, esperando y agotadas.
+- PostgreSQL: `pg_stat_activity`, `pg_locks`, deadlocks, consultas lentas, CPU, memoria, disco y WAL.
+- Uso de CPU y memoria de API, AI Mock y PostgreSQL.
+- Latencia, errores y cantidad de llamadas al servicio de IA.
+- En una arquitectura productiva, profundidad de colas, edad del evento más antiguo y reintentos del broker.
+
+La correlacion recomendada para diagnosticar una solicitud es:
+
+```text
+traceId
+	-> log transaction_received
+	-> consultas y locks observados en PostgreSQL durante la ventana
+	-> log transaction_completed o transaction_rejected
+	-> log ai_call_started / ai_call_succeeded / ai_call_failed
+```
+
+En produccion se recomienda OpenTelemetry para propagar el trace entre API, base de datos, IA y Bancs. Esta capacidad distribuida no esta instalada en el MVP; actualmente se utiliza el `traceId` propio de la API.
+
+### Matriz de diagnostico
+
+| Sintoma | Señales a revisar | Hipotesis inicial | Accion de investigacion |
+|---|---|---|---|
+| Latencia alta | p95/p99, duracion de transacciones y pool | Contencion de cuentas, consultas lentas o pool agotado | Comparar duracion por `traceId`, revisar `pg_stat_activity` y localizar sesiones esperando. |
+| Timeouts de base de datos | Errores de API, conexiones esperando y `pg_stat_activity` | PostgreSQL saturado o conexiones retenidas demasiado tiempo | Revisar limites del pool, transacciones abiertas y consumo de CPU, memoria y disco. |
+| Deadlocks | Logs de error, `pg_locks` y eventos de PostgreSQL | Locks adquiridos en orden distinto o transacciones demasiado largas | Identificar las sesiones involucradas y confirmar el orden de bloqueo de las cuentas. |
+| Transferencias rechazadas | Contadores por estado y campo `reason` | Datos invalidos, moneda incompatible o fondos insuficientes | Correlacionar el `traceId` con la respuesta y diferenciar error de negocio de error interno. |
+| IA degradada | `smartbancs_ai_calls_total`, logs y latencia del mock | Servicio de IA lento o no disponible | Aislar IA; confirmar que las transferencias siguen completandose despues del `COMMIT`. |
 
 ## Incidente
 
@@ -207,17 +250,48 @@ Durante un pico de quincena aumentan la latencia, los timeouts de PostgreSQL y l
 
 ### Diagnostico y acciones inmediatas
 
-1. Confirmar alcance con `/health`, throughput, errores y p95/p99.
-2. Agrupar logs por `traceId`, `reason` y duracion.
-3. Revisar `pg_stat_activity`, `pg_locks`, conexiones del pool, CPU, memoria y disco.
-4. Identificar la consulta o cuenta que concentra la contencion.
-5. Aislar consumidores no criticos como IA y activar backpressure.
-6. Reducir reintentos agresivos, usar circuit breaker y terminar solo sesiones bloqueadas identificadas.
-7. Escalar la API si el cuello esta en concurrencia HTTP y mantener idempotencia para los reintentos.
+El objetivo inicial es estabilizar el servicio y evitar transferencias parciales, no cambiar el esquema en caliente sin evidencia. El runbook propuesto es:
+
+1. Declarar el incidente, asignar un responsable tecnico y registrar hora de inicio, alcance y cambios recientes.
+2. Confirmar el alcance con `/health`, throughput, errores, timeouts y p95/p99.
+3. Agrupar logs por `traceId`, `transactionId`, `event`, `reason` y duracion para separar fallos de negocio de fallos de infraestructura.
+4. Revisar `pg_stat_activity`, `pg_locks`, conexiones del pool, consultas activas, CPU, memoria, disco y WAL.
+5. Identificar la consulta, instancia o cuenta que concentra la contencion; una cuenta muy utilizada puede ser un `hot row`.
+6. Activar backpressure o rate limiting y reducir reintentos agresivos para evitar una tormenta de solicitudes.
+7. Aislar consumidores no criticos como IA y detener temporalmente workers o llamadas secundarias si consumen conexiones o CPU.
+8. Finalizar solo sesiones bloqueadas que hayan sido identificadas y aprobadas por el responsable de base de datos; no matar sesiones al azar.
+9. Escalar la API si el cuello esta en concurrencia HTTP y mantener idempotencia en todos los reintentos.
+10. Validar la recuperacion con `/health`, errores, latencia, locks y una transferencia controlada antes de cerrar el incidente.
+
+Durante el incidente no se deben desactivar los locks, eliminar restricciones de saldo ni confirmar manualmente una transferencia sin trazabilidad. Si existe duda sobre el estado de una solicitud, se consulta por `idempotencyKey`, `transactionId` y `traceId` antes de reintentar.
 
 ### Post mortem y prevencion
 
-El post mortem debe incluir impacto, linea de tiempo, deteccion, causa raiz, decisiones, trazas afectadas y acciones con responsable y fecha. Las acciones preventivas incluyen pruebas de carga y caos, alertas de locks y pool agotado, transacciones mas cortas, orden estable de locks, runbooks, backups probados y conciliacion automatizada.
+El post mortem debe ser sin culpabilizar y debe convertir el incidente en acciones verificables. La estructura propuesta es:
+
+1. **Resumen ejecutivo:** que ocurrio, cuando, duracion, severidad y estado final.
+2. **Impacto:** porcentaje de solicitudes afectadas, endpoints, usuarios, transacciones rechazadas o demoradas y si existio impacto financiero.
+3. **Deteccion:** alerta o reporte que inicio el incidente, tiempo hasta detectar y tiempo hasta asignar responsable.
+4. **Linea de tiempo:** despliegues, aumento de trafico, sintomas, decisiones, mitigaciones y recuperacion, todos con hora y zona horaria.
+5. **Evidencias:** metricas, logs por `traceId`, consultas de `pg_stat_activity`, locks, errores y cambios realizados.
+6. **Causa raiz y factores contribuyentes:** por ejemplo, pool agotado junto con contencion sobre una cuenta y reintentos excesivos.
+7. **Resolucion y comunicacion:** acciones que estabilizaron el servicio, responsables de aprobarlas y mensajes enviados a las partes interesadas.
+8. **Que funciono y que no:** alertas, runbooks, pruebas, limites de capacidad y decisiones que deben conservarse o cambiarse.
+9. **Acciones preventivas:** tareas concretas con responsable, prioridad, fecha limite y criterio de verificacion.
+
+Acciones preventivas recomendadas:
+
+| Ambito | Accion | Criterio de verificacion |
+|---|---|---|
+| Infraestructura | Dimensionar el pool, usar PgBouncer y alertar por conexiones esperando | Prueba de carga sin agotamiento del pool y alerta validada. |
+| Base de datos | Revisar planes, consultas lentas, locks, deadlocks y particionamiento del historico | `EXPLAIN ANALYZE`, alertas de locks y medicion de p95/p99. |
+| Codigo | Mantener orden determinista de locks, acortar transacciones y conservar idempotencia | Pruebas concurrentes sin saldos inconsistentes ni duplicados. |
+| Resiliencia | Aplicar backpressure, rate limiting, timeouts, circuit breaker y reintentos con backoff | Simulacion de PostgreSQL o IA degradados sin transferencias parciales. |
+| Operacion | Mantener runbook, responsables de guardia y prueba periodica de recuperacion | Simulacro documentado con tiempos de deteccion y recuperacion. |
+| Datos | Ejecutar conciliacion, backups y pruebas de restauracion | Restauracion exitosa y diferencias conciliadas entre saldos e historial. |
+| Capacidad | Ejecutar pruebas de carga con muchas cuentas y distribuir la carga | Objetivo de TPS, p95/p99 y tasa de errores medidos en un entorno dimensionado. |
+
+El cierre del post mortem requiere comprobar que cada accion tiene evidencia. Una tarea no se considera cerrada solo por estar escrita; debe existir una prueba, alerta, dashboard, cambio de codigo o simulacro que demuestre la mejora.
 
 ## ETL y datos para IA
 

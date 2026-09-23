@@ -12,6 +12,10 @@ curl http://localhost:4000/metrics
 docker compose logs api ai-mock
 docker compose down
 ```
+Para comprobar que las recomendaciones fueron guardadas en PostgreSQL:
+
+```powershell
+docker compose exec postgres psql -U smartbancs -d smartbancs -c "SELECT transaction_id, recommendation FROM ai_recommendations ORDER BY created_at DESC limit 5;"
 
 Para ejecutar el ETL con Node.js y npm instalados: `npm install` y `npm run etl`.
 
