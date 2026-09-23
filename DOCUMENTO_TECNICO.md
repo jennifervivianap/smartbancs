@@ -6,35 +6,51 @@ El MVP recibe transferencias por REST, actualiza dos cuentas de forma atomica en
 
 ## Arquitectura
 
-La arquitectura separa el camino transaccional, que debe ser corto y consistente, de los procesos posteriores como IA, conciliacion y sincronizacion con Bancs.
+El proyecto utiliza una arquitectura de microservicios ligera, orientada a servicios y desplegada localmente con Docker Compose. El camino transaccional pasa por una API REST y PostgreSQL; el procesamiento de recomendaciones se delega a un servicio separado de IA despues de confirmar la transferencia.
+
+```mermaid
+flowchart TB
+	Client[Cliente HTTP] --> API[API REST SmartBancs<br/>Express + TypeScript]
+	API --> DB[(PostgreSQL 16<br/>cuentas, transferencias y recomendaciones)]
+	API -. despues de COMMIT .-> AI[AI Mock<br/>Express + TypeScript]
+	API --> Metrics[Logs JSON<br/>metricas Prometheus]
+	ETL[Script ETL<br/>scripts/etl.ts] --> Clean[data/clean-transactions.json]
+	Raw[data/raw-transactions.json] --> ETL
+
+	subgraph Compose[Docker Compose]
+		API
+		DB
+		AI
+	end
+```
+
+El flujo implementado es:
 
 ```mermaid
 flowchart LR
-	Client[Cliente] --> LB[Load balancer]
-	LB --> API1[API SmartBancs]
-	LB --> API2[API replica]
-	API1 --> DB[(PostgreSQL)]
-	API2 --> DB
-	API1 -. despues del commit .-> AI[AI Mock]
-	API2 -. despues del commit .-> AI
-	API1 -. arquitectura productiva .-> Broker[(Broker durable)]
-	API2 -. arquitectura productiva .-> Broker
-	Broker --> AIWorker[Workers de IA]
-	Broker --> BancsAdapter[Adaptador Bancs]
-	BancsAdapter --> Bancs[(Core legado Bancs)]
-	API1 --> Obs[Logs y metricas]
-	API2 --> Obs
+	Request[POST /transactions] --> Validate[Validacion de entrada]
+	Validate --> Tx[Transaccion PostgreSQL]
+	Tx --> Lock[SELECT FOR UPDATE<br/>bloqueo ordenado de cuentas]
+	Lock --> Balance[Actualizar saldos]
+	Balance --> Commit[COMMIT]
+	Commit --> Response[Respuesta 201 al cliente]
+	Commit -. proceso posterior .-> Recommendation[POST /recommendations]
+	Recommendation --> AIStore[(ai_recommendations)]
 ```
 
-En el MVP, Docker Compose levanta una API, PostgreSQL y el mock de IA. El balanceador, el broker, los workers y el adaptador Bancs representan la evolucion productiva; no se presentan como componentes ya implementados.
+El archivo `docker-compose.yml` levanta tres contenedores: `smartbancs-db` con PostgreSQL 16, `smartbancs-api` en el puerto 4000 y `smartbancs-ai-mock` en el puerto 4001. El volumen `pgdata` conserva los datos de PostgreSQL y `db/init.sql` crea el esquema inicial y las cuentas de demostracion.
+
+El balanceador, las replicas de API, el broker durable, los workers y el adaptador Bancs representan la evolucion productiva documentada mas adelante; no son componentes implementados en este MVP.
 
 | Componente | Responsabilidad | Implementacion actual |
 |---|---|---|
-| API | Validacion, idempotencia y transferencia atomica | TypeScript, Express y `pg` |
-| PostgreSQL | Saldos, transferencias y recomendaciones | PostgreSQL 16 |
-| AI Mock | Simular inferencia, latencia y fallos | Servicio TypeScript independiente |
-| ETL | Limpiar datos para analisis o IA | `scripts/etl.ts` |
-| Broker y adaptador Bancs | Desacoplar y agrupar sincronizaciones | Arquitectura propuesta |
+| Cliente | Enviar solicitudes REST y claves de idempotencia | Cliente HTTP, curl o `scripts/smoke-test.ts` |
+| API | Validacion, idempotencia, locks y transferencia atomica | TypeScript, Express y `pg`, puerto 4000 |
+| PostgreSQL | Saldos, transferencias y recomendaciones | PostgreSQL 16, puerto 5432 |
+| AI Mock | Simular inferencia, latencia y fallos | Servicio TypeScript independiente, puerto 4001 |
+| ETL | Limpiar datos para analisis o IA | `scripts/etl.ts`, ejecutado fuera de Compose |
+| Observabilidad | Logs, metricas y trazabilidad | Pino, `prom-client`, `/metrics` y `traceId` |
+| Broker y adaptador Bancs | Desacoplar y agrupar sincronizaciones | Arquitectura productiva propuesta |
 
 ### Flujo de una transferencia
 
