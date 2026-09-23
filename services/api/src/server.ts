@@ -21,6 +21,11 @@ function traceIdOf(req: Request): string {
   return header && /^[0-9a-f-]{36}$/i.test(header) ? header : randomUUID();
 }
 
+function observeTransaction(status: string, started: number): void {
+  transactions.inc({ status });
+  transactionDuration.observe(Date.now() - started);
+}
+
 async function rollback(client: PoolClient): Promise<void> {
   try { await client.query('ROLLBACK'); } catch { /* connection will be released */ }
 }
@@ -57,11 +62,13 @@ app.post('/transactions', async (req, res) => {
   const { sourceAccountId, targetAccountId, amountCents, currency = 'USD', idempotencyKey } = req.body ?? {};
   logger.info({ event: 'transaction_received', traceId });
   if (!sourceAccountId || !targetAccountId || sourceAccountId === targetAccountId || !Number.isSafeInteger(amountCents) || amountCents <= 0) {
-    transactions.inc({ status: 'rejected' });
+    observeTransaction('rejected', started);
+    logger.warn({ event: 'transaction_rejected', traceId, reason: 'invalid_request' });
     return res.status(400).json({ error: 'Invalid transaction request', traceId });
   }
-  const client = await pool.connect();
+  let client: PoolClient;
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
     if (idempotencyKey) {
       const existing = await client.query('SELECT id, trace_id, status, target_account_id, amount_cents, currency FROM transactions WHERE source_account_id = $1 AND idempotency_key = $2', [sourceAccountId, idempotencyKey]);
@@ -70,10 +77,13 @@ app.post('/transactions', async (req, res) => {
         if (previous.target_account_id !== targetAccountId || Number(previous.amount_cents) !== amountCents || previous.currency.trim() !== currency) {
           await rollback(client);
           client.release();
+          observeTransaction('rejected', started);
+          logger.warn({ event: 'transaction_rejected', traceId, reason: 'idempotency_conflict' });
           return res.status(409).json({ error: 'Idempotency key already used with different transaction data', traceId });
         }
         await client.query('COMMIT');
         client.release();
+        observeTransaction('idempotent', started);
         return res.status(200).json({ transactionId: previous.id, traceId: previous.trace_id, status: previous.status, idempotent: true });
       }
     }
@@ -82,6 +92,8 @@ app.post('/transactions', async (req, res) => {
     if (accounts.rowCount !== 2) {
       await rollback(client);
       client.release();
+      observeTransaction('rejected', started);
+      logger.warn({ event: 'transaction_rejected', traceId, reason: 'account_not_found' });
       return res.status(404).json({ error: 'Account not found', traceId });
     }
     const source = accounts.rows.find((account) => account.id === sourceAccountId);
@@ -89,11 +101,15 @@ app.post('/transactions', async (req, res) => {
     if (source.currency.trim() !== currency || target.currency.trim() !== currency) {
       await rollback(client);
       client.release();
+      observeTransaction('rejected', started);
+      logger.warn({ event: 'transaction_rejected', traceId, reason: 'currency_mismatch' });
       return res.status(400).json({ error: 'Currency mismatch', traceId });
     }
     if (BigInt(source.balance_cents) < BigInt(amountCents)) {
       await rollback(client);
       client.release();
+      observeTransaction('rejected', started);
+      logger.warn({ event: 'transaction_rejected', traceId, reason: 'insufficient_funds' });
       return res.status(409).json({ error: 'Insufficient funds', traceId });
     }
     const transactionId = randomUUID();
@@ -102,14 +118,16 @@ app.post('/transactions', async (req, res) => {
     await client.query('INSERT INTO transactions (id, trace_id, source_account_id, target_account_id, amount_cents, currency, idempotency_key, status, completed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())', [transactionId, traceId, sourceAccountId, targetAccountId, amountCents, currency, idempotencyKey ?? null, 'COMPLETED']);
     await client.query('COMMIT');
     client.release();
-    transactions.inc({ status: 'completed' });
-    transactionDuration.observe(Date.now() - started);
+    observeTransaction('completed', started);
     logger.info({ event: 'transaction_completed', transactionId, traceId, durationMs: Date.now() - started });
     void requestRecommendation(transactionId, traceId, amountCents);
     return res.status(201).json({ transactionId, traceId, status: 'COMPLETED' });
   } catch (error) {
-    await rollback(client); client.release();
-    transactions.inc({ status: 'error' });
+    if (client!) {
+      await rollback(client);
+      client.release();
+    }
+    observeTransaction('error', started);
     logger.error({ event: 'transaction_failed', traceId, error: String(error) });
     return res.status(500).json({ error: 'Transaction failed', traceId });
   }
