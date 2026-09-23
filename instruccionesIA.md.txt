@@ -1,0 +1,375 @@
+# Guia de resolucion con IA - Reto Tecnico SmartBancs
+
+## 1. Objetivo de esta guia
+
+Esta guia describe una solucion MVP que se puede implementar y demostrar rapidamente con TypeScript. El objetivo no es construir un banco completo, sino evidenciar cada requisito del reto:
+
+- API REST para transferencias.
+- Persistencia en PostgreSQL.
+- Control de concurrencia y prevencion de race conditions/deadlocks.
+- Infraestructura reproducible con Docker Compose.
+- ETL de transacciones para consumo analitico o de IA.
+- Servicio de IA independiente y no bloqueante.
+- Logs, metricas y trazabilidad con `traceId`.
+- Documento tecnico y respuesta al incidente simulado.
+
+El alcance debe mantenerse pequeno. Cada componente debe ser ejecutable y demostrable.
+
+## 2. Entregable minimo recomendado
+
+Estructura esperada:
+
+```text
+smartbancs/
+  docker-compose.yml
+  README.md
+  instruccionesIA.md
+  DOCUMENTO_TECNICO.md
+  DECLARACION_IA.md
+  db/init.sql
+  services/api/
+    Dockerfile
+    package.json
+    tsconfig.json
+    src/server.ts
+    src/db.ts
+    src/metrics.ts
+  services/ai-mock/
+    Dockerfile
+    package.json
+    tsconfig.json
+    src/server.ts
+  scripts/
+    etl.ts
+  data/
+    raw-transactions.json
+```
+
+El repositorio actual ya tiene `docker-compose.yml` y `db/init.sql`. El Compose ya define tres servicios: `postgres`, `api` y `ai-mock`. Por tanto, la prioridad es crear los directorios y archivos que esos servicios necesitan, sin cambiar el alcance.
+
+## 3. Arquitectura propuesta
+
+```text
+Cliente
+  |
+  | POST /transactions
+  v
+API TypeScript
+  |-- PostgreSQL: transaccion atomica y bloqueo de cuentas
+  |-- evento asincrono: llamada a AI Mock
+  |
+  +--> AI Mock: recomendacion sin bloquear la transferencia
+
+Proceso ETL: raw-transactions.json -> clean-transactions.json -> entrenamiento/analitica
+```
+
+### Decisiones que se deben defender
+
+- **TypeScript + Express:** conocido, rapido de implementar y suficiente para el MVP REST.
+- **PostgreSQL:** transacciones ACID, claves foraneas, `CHECK` y bloqueos de filas.
+- **Docker Compose:** permite levantar API, base de datos y IA con un comando.
+- **IA desacoplada:** la transferencia responde aunque la recomendacion tarde o falle.
+- **UUID de transaccion y `traceId`:** permiten idempotencia basica y rastreo entre servicios.
+
+Para soportar 10 000 TPS en produccion se agregarian un broker (Kafka/RabbitMQ), multiples replicas, pool de conexiones, cache y un adaptador de Bancs. El MVP demuestra el patron, no pretende simular esa capacidad en un laptop.
+
+## 4. Contrato de la API
+
+### `POST /transactions`
+
+Request:
+
+```json
+{
+  "sourceAccountId": "11111111-1111-1111-1111-111111111111",
+  "targetAccountId": "22222222-2222-2222-2222-222222222222",
+  "amountCents": 1000,
+  "currency": "USD",
+  "idempotencyKey": "demo-001"
+}
+```
+
+Respuesta exitosa `201`:
+
+```json
+{
+  "transactionId": "uuid",
+  "traceId": "uuid",
+  "status": "COMPLETED"
+}
+```
+
+Errores recomendados:
+
+- `400`: request invalido, monto no positivo o cuentas iguales.
+- `404`: cuenta inexistente.
+- `409`: saldo insuficiente o clave de idempotencia repetida con otro request.
+- `500`: error inesperado.
+- `503`: dependencia temporalmente no disponible.
+
+Tambien implementar:
+
+- `GET /health`: salud de la API y base de datos.
+- `GET /metrics`: metricas Prometheus.
+
+## 5. Flujo transaccional correcto
+
+1. Crear o leer el `traceId` desde `X-Trace-Id`; si no existe, generar UUID.
+2. Validar body y monto antes de abrir una transaccion SQL.
+3. Abrir `BEGIN`.
+4. Bloquear las dos cuentas con `SELECT ... FOR UPDATE`.
+5. Ordenar siempre los IDs de cuenta antes de bloquearlos. Esto evita que dos transferencias inversas generen deadlock.
+6. Verificar moneda y saldo.
+7. Descontar de la cuenta origen y acreditar la cuenta destino.
+8. Insertar la transferencia como `COMPLETED`.
+9. Ejecutar `COMMIT`.
+10. Responder al cliente inmediatamente.
+11. Despues del commit, disparar la llamada al servicio de IA sin `await` dentro del flujo de respuesta. Registrar cualquier fallo sin revertir la transferencia.
+
+Pseudocodigo:
+
+```ts
+const traceId = request.headers['x-trace-id'] ?? randomUUID();
+validate(request.body);
+
+await database.transaction(async (client) => {
+  const accountIds = [sourceAccountId, targetAccountId].sort();
+  const accounts = await client.query(
+    `SELECT id, balance_cents, currency
+       FROM accounts
+      WHERE id = ANY($1::uuid[])
+      ORDER BY id
+      FOR UPDATE`,
+    [accountIds]
+  );
+
+  assertAccountsAndBalance(accounts, request.body);
+  await client.query('UPDATE accounts SET balance_cents = balance_cents - $1 WHERE id = $2', [amount, sourceAccountId]);
+  await client.query('UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2', [amount, targetAccountId]);
+  await client.query('INSERT INTO transactions (...) VALUES (...)', [...]);
+});
+
+void requestRecommendation({ transactionId, traceId }).catch((error) =>
+  logger.error({ error, traceId, transactionId }, 'ai_call_failed')
+);
+
+return response.status(201).json({ transactionId, traceId, status: 'COMPLETED' });
+```
+
+En el codigo real se debe hacer `ROLLBACK` en el `catch`, liberar siempre el cliente y usar parametros SQL, nunca concatenar valores del usuario.
+
+## 6. Idempotencia y seguridad minima
+
+Agregar una columna `idempotency_key` en `transactions` y un indice unico por cuenta origen si el codigo recibira reintentos. Si no se desea alterar el SQL en la primera iteracion, documentar que la clave es una mejora inmediata.
+
+Validaciones necesarias:
+
+- `amountCents` debe ser entero positivo.
+- No usar `number` para dinero decimal; usar centavos como `BIGINT`.
+- Verificar que origen y destino existan.
+- Rechazar monedas diferentes.
+- Limitar el tamano del body y aplicar timeout a llamadas HTTP.
+- No registrar credenciales, tokens ni datos sensibles.
+- En produccion, autenticar clientes, cifrar trafico y aplicar rate limiting.
+
+## 7. Servicio de IA mock
+
+Crear un servicio Express en el puerto `4001`:
+
+- `POST /recommendations` recibe `transactionId`, `traceId`, cuenta y monto.
+- Espera entre 50 y 150 ms para simular inferencia.
+- Devuelve una recomendacion JSON, por ejemplo: ahorro, alerta de gasto o presupuesto.
+- Usa un timeout de cliente de aproximadamente 300 ms.
+- La API principal no debe esperar esta respuesta para marcar la transferencia como completada.
+- Registrar `ai_call_started`, `ai_call_succeeded` y `ai_call_failed` con `traceId`.
+
+La recomendacion puede persistirse en `ai_recommendations` como tarea posterior. Si el mock falla, la transferencia debe seguir siendo exitosa.
+
+## 8. Observabilidad minima
+
+Usar logs JSON con estas propiedades:
+
+```json
+{
+  "level": "info",
+  "event": "transaction_completed",
+  "traceId": "uuid",
+  "transactionId": "uuid",
+  "durationMs": 42,
+  "amountCents": 1000
+}
+```
+
+Eventos obligatorios:
+
+- `transaction_received`
+- `db_transaction_started`
+- `db_transaction_completed`
+- `transaction_completed`
+- `transaction_rejected`
+- `db_error` o `deadlock_detected`
+- `ai_call_started`
+- `ai_call_succeeded` / `ai_call_failed`
+
+Metricas Prometheus recomendadas:
+
+- `smartbancs_transactions_total{status}`
+- `smartbancs_transaction_duration_ms`
+- `smartbancs_db_errors_total`
+- `smartbancs_ai_calls_total{status}`
+- `smartbancs_ai_duration_ms`
+- `smartbancs_active_requests`
+
+La informacion mas importante para diagnosticar el incidente es `traceId`, duracion, estado HTTP, error SQL, tiempo de espera del pool, numero de conexiones activas y tasa de deadlocks.
+
+## 9. ETL requerido
+
+Crear `data/raw-transactions.json` con filas que incluyan fechas en formatos distintos, nombres con espacios, monedas en minuscula y algunos valores nulos.
+
+Crear `scripts/etl.ts` que:
+
+1. Lea el JSON de entrada.
+2. Elimine filas sin cuenta o monto valido.
+3. Reemplace nulos permitidos por valores definidos.
+4. Normalice `currency` a mayusculas.
+5. Convierta fechas a ISO-8601 UTC.
+6. Convierta montos a centavos.
+7. Produzca `data/clean-transactions.json` con un esquema estable para analitica/IA.
+8. Informe cuantas filas leyo, limpio y rechazo.
+
+Ejemplo de salida:
+
+```json
+{
+  "transactionId": "tx-001",
+  "sourceAccountId": "11111111-1111-1111-1111-111111111111",
+  "targetAccountId": "22222222-2222-2222-2222-222222222222",
+  "amountCents": 1250,
+  "currency": "USD",
+  "occurredAt": "2026-01-15T14:00:00.000Z"
+}
+```
+
+## 10. Integracion teorica con Bancs
+
+No conectar directamente cada request con el core legado. Usar este flujo:
+
+1. La API valida y registra la operacion en la plataforma nueva.
+2. Publica un evento `TransferCompleted` en un broker durable.
+3. Un adaptador Bancs consume eventos, agrupa actualizaciones y aplica lotes controlados.
+4. El adaptador usa reintentos con backoff, circuit breaker y clave idempotente.
+5. Un proceso de conciliacion compara saldos y eventos entre SmartBancs y Bancs.
+6. Las discrepancias van a una cola de errores para reproceso manual.
+
+Para el MVP, representar el adaptador con logs o un endpoint mock. Explicar que Bancs es la fuente definitiva del saldo en la sincronizacion final y que nunca se debe saturar con consultas por transferencia.
+
+## 11. Incidente: timeouts y deadlocks
+
+### Acciones inmediatas
+
+1. Confirmar el incidente en `/metrics`, logs y health checks.
+2. Medir p95/p99 de latencia, errores de pool y deadlocks por `traceId`.
+3. Reducir temporalmente el trafico con rate limiting o apagar consumidores no criticos, como recomendaciones.
+4. Revisar `pg_stat_activity` y terminar solo sesiones bloqueadas identificadas.
+5. Verificar conexiones, CPU, memoria y almacenamiento de PostgreSQL.
+6. Aumentar temporalmente el pool solo si existe capacidad real; no ocultar el problema saturando la base.
+7. Activar reintentos limitados para deadlocks y timeouts, con backoff y jitter.
+8. Mantener la IA fuera del camino critico.
+9. Comunicar estado, impacto y proxima actualizacion.
+
+### Prevencion
+
+- Bloqueo de cuentas siempre en orden determinista.
+- Transacciones cortas y sin llamadas HTTP dentro del `BEGIN`.
+- Pool con limites y timeouts.
+- Indices en `trace_id`, `status` y fecha.
+- Pruebas de carga y concurrencia.
+- Alertas para p95, errores 5xx, pool agotado, deadlocks y lag del broker.
+- Runbook de rollback y reconciliacion.
+
+### Postmortem
+
+Incluir impacto, linea de tiempo, deteccion, causa raiz, factores contribuyentes, acciones de mitigacion, acciones preventivas con responsables y fechas, y metricas que demuestren que el problema no se repite.
+
+## 12. Orden de implementacion para 2 horas
+
+### Minutos 0-20: base ejecutable
+
+- Crear `services/api` y `services/ai-mock`.
+- Agregar `package.json`, TypeScript, Dockerfiles y servidores HTTP.
+- Implementar `/health` y confirmar que Compose construye.
+
+### Minutos 20-60: transferencia
+
+- Conectar `pg` con pool.
+- Implementar `POST /transactions` con transaccion SQL.
+- Bloquear cuentas ordenadas, actualizar saldos e insertar transaccion.
+- Agregar validaciones, rollback y `traceId`.
+
+### Minutos 60-80: IA, logs y metricas
+
+- Implementar el mock de recomendaciones.
+- Disparar la llamada asincrona despues del commit.
+- Agregar logs estructurados y `/metrics`.
+
+### Minutos 80-100: ETL y documentacion
+
+- Crear datos crudos y script ETL.
+- Completar `README.md` y `DOCUMENTO_TECNICO.md`.
+- Agregar `DECLARACION_IA.md` indicando que se uso un asistente de IA para apoyo en diseno, codigo y documentacion, y que todo fue revisado.
+
+### Minutos 100-120: prueba y evidencia
+
+Ejecutar:
+
+```bash
+docker compose up --build -d
+docker compose ps
+curl http://localhost:4000/health
+curl -X POST http://localhost:4000/transactions -H "Content-Type: application/json" -d "{\"sourceAccountId\":\"11111111-1111-1111-1111-111111111111\",\"targetAccountId\":\"22222222-2222-2222-2222-222222222222\",\"amountCents\":1000,\"currency\":\"USD\"}"
+curl http://localhost:4000/metrics
+npm run etl
+
+docker compose logs api ai-mock
+```
+
+Guardar capturas o video mostrando: `docker compose up`, health check, transferencia exitosa, logs con el mismo `traceId`, recomendacion asincrona y metricas.
+
+Al finalizar:
+
+```bash
+docker compose down
+```
+
+Para reiniciar tambien los datos locales:
+
+```bash
+docker compose down -v
+```
+
+## 13. Guion de defensa de 3 minutos
+
+1. **Contexto, 20 segundos:** SmartBancs recibe transferencias en tiempo real y no puede saturar Bancs.
+2. **Arquitectura, 40 segundos:** API TypeScript, PostgreSQL, IA independiente y ETL; Docker Compose reproduce el entorno.
+3. **Concurrencia, 40 segundos:** transferencia ACID, bloqueo ordenado de ambas cuentas, centavos como enteros, rollback e idempotencia.
+4. **IA, 25 segundos:** recomendacion asincrona despues del commit; una falla de IA no falla la transferencia.
+5. **Observabilidad, 25 segundos:** logs JSON, `traceId`, metricas de volumen, errores y latencia.
+6. **Incidente, 30 segundos:** aislar IA, revisar pool y `pg_stat_activity`, terminar bloqueos, aplicar backoff y corregir orden de locks.
+
+Frase de cierre: "El MVP prueba el flujo critico y deja claros los puntos de evolucion para 10 000 TPS: broker, replicas, particionamiento, cache, autoscaling y adaptador controlado hacia Bancs."
+
+## 14. Criterio de terminado
+
+Antes de entregar, comprobar:
+
+- `docker compose up --build` funciona desde un entorno limpio.
+- El endpoint exitoso modifica ambos saldos atomically.
+- Saldo insuficiente no modifica ninguna cuenta.
+- Dos transferencias concurrentes no dejan saldos inconsistentes.
+- La IA puede fallar sin convertir la transferencia en error.
+- Existe al menos un log por operacion critica con `traceId`.
+- `/metrics` devuelve contadores y latencias.
+- ETL genera una salida limpia.
+- README explica instalar, ejecutar, probar y detener.
+- `DOCUMENTO_TECNICO.md` cubre Bancs, IA, observabilidad e incidente.
+- `DECLARACION_IA.md` declara honestamente el uso de herramientas de IA.

@@ -17,4 +17,4 @@ Para ejecutar el ETL con Node.js y npm instalados: `npm install` y `npm run etl`
 
 Con los servicios levantados, el smoke test de integración se ejecuta con `npm run test:smoke`.
 
-La explicacion tecnica esta en [DOCUMENTO_TECNICO.md](DOCUMENTO_TECNICO.md), la declaracion de IA en [DECLARACION_IA.md](DECLARACION_IA.md) y la guia detallada de implementacion en [instruccionesIA.md](instruccionesIA.md).
+La explicacion tecnica esta en [DOCUMENTO_TECNICO.md](DOCUMENTO_TECNICO.md), la declaracion de IA en [DECLARACION_IA.md](DECLARACION_IA.md).
